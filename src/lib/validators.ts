@@ -41,6 +41,15 @@ export const monitorCreateSchema = z.object({
   timeoutMs: z.coerce.number().int().min(1000).max(30000).default(10000),
   intervalSec: z.coerce.number().int().min(30).max(3600).default(60),
   maxRetries: z.coerce.number().int().min(0).max(5).default(2),
+  // ── Smart checks (Option 2) ──
+  kind: z.enum(["HTTP", "HEARTBEAT"]).default("HTTP"),
+  keyword: z.string().trim().max(500).optional(),
+  forbiddenKeyword: z.string().trim().max(500).optional(),
+  sslCheckEnabled: z.boolean().default(false),
+  sslWarnDays: z.coerce.number().int().min(1).max(90).default(14),
+  confirmFailures: z.coerce.number().int().min(1).max(5).default(1),
+  heartbeatIntervalSec: z.coerce.number().int().min(60).max(86400).default(3600),
+  heartbeatGraceSec: z.coerce.number().int().min(0).max(86400).default(300),
 });
 
 export const monitorUpdateSchema = monitorCreateSchema.partial().extend({

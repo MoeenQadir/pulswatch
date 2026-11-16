@@ -39,6 +39,17 @@ export async function PATCH(req: Request, { params }: Params) {
     delete data.paused;
     data.status = paused ? "PAUSED" : "PENDING";
   }
+  // Blank keywords mean "not configured".
+  for (const key of ["keyword", "forbiddenKeyword"] as const) {
+    if (typeof data[key] === "string" && !(data[key] as string).trim()) {
+      data[key] = null;
+    }
+  }
+  // Switching a monitor to HEARTBEAT without a token needs one generated.
+  if (data.kind === "HEARTBEAT" && !monitor.heartbeatToken) {
+    const { randomBytes } = await import("node:crypto");
+    data.heartbeatToken = randomBytes(16).toString("hex");
+  }
 
   const updated = await prisma.monitor.update({ where: { id: monitor.id }, data });
 

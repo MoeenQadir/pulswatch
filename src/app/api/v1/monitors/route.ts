@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { randomBytes } from "node:crypto";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
 import { monitorCreateSchema } from "@/lib/validators";
@@ -60,6 +61,20 @@ export async function GET(req: Request) {
       lastCheckedAt: m.lastCheckedAt,
       totalChecks: m._count.checks,
       createdAt: m.createdAt,
+      // Smart-check config (heartbeatToken is deliberately excluded here —
+      // it is only returned on creation and on the single-monitor GET).
+      kind: m.kind,
+      keyword: m.keyword,
+      forbiddenKeyword: m.forbiddenKeyword,
+      sslCheckEnabled: m.sslCheckEnabled,
+      sslWarnDays: m.sslWarnDays,
+      sslExpiresAt: m.sslExpiresAt,
+      sslDaysLeft: m.sslDaysLeft,
+      confirmFailures: m.confirmFailures,
+      consecutiveFailures: m.consecutiveFailures,
+      heartbeatIntervalSec: m.heartbeatIntervalSec,
+      heartbeatGraceSec: m.heartbeatGraceSec,
+      lastHeartbeatAt: m.lastHeartbeatAt,
     })),
   });
 }
@@ -81,6 +96,19 @@ export async function POST(req: Request) {
       timeoutMs: body.data.timeoutMs,
       intervalSec: body.data.intervalSec,
       maxRetries: body.data.maxRetries,
+      kind: body.data.kind,
+      keyword: body.data.keyword?.trim() ? body.data.keyword : null,
+      forbiddenKeyword: body.data.forbiddenKeyword?.trim() ? body.data.forbiddenKeyword : null,
+      sslCheckEnabled: body.data.sslCheckEnabled,
+      sslWarnDays: body.data.sslWarnDays,
+      confirmFailures: body.data.confirmFailures,
+      heartbeatIntervalSec: body.data.heartbeatIntervalSec,
+      heartbeatGraceSec: body.data.heartbeatGraceSec,
+      // The heartbeat token is the monitor's only credential for
+      // POST /api/v1/heartbeats/:token — generated server-side, returned
+      // once to the owner in this 201 response.
+      heartbeatToken:
+        body.data.kind === "HEARTBEAT" ? randomBytes(16).toString("hex") : null,
     },
   });
 

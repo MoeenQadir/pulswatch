@@ -25,16 +25,47 @@ const pick = <T>(arr: T[]): T => arr[Math.floor(rand() * arr.length)];
 
 const MINUTE = 60 * 1000;
 
-type MonitorSpec = { name: string; url: string; intervalSec: number; sla: number };
+type MonitorSpec = {
+  name: string;
+  url: string;
+  intervalSec: number;
+  sla: number;
+  kind?: "HTTP" | "HEARTBEAT";
+  keyword?: string;
+  sslCheckEnabled?: boolean;
+  confirmFailures?: number;
+  heartbeatIntervalSec?: number;
+  heartbeatGraceSec?: number;
+  /** Minutes ago the heartbeat monitor last pinged (demo: recently, so UP). */
+  lastHeartbeatMinutesAgo?: number;
+};
 
 const monitorSpecs: MonitorSpec[] = [
-  { name: "Marketing Site", url: "https://pulsewatch.dev", intervalSec: 60, sla: 0.999 },
+  {
+    name: "Marketing Site",
+    url: "https://pulsewatch.dev",
+    intervalSec: 60,
+    sla: 0.999,
+    keyword: "PulseWatch",
+    sslCheckEnabled: true,
+    confirmFailures: 2,
+  },
   { name: "API Gateway", url: "https://api.pulsewatch.dev/health", intervalSec: 30, sla: 0.998 },
   { name: "App Dashboard", url: "https://app.pulsewatch.dev", intervalSec: 60, sla: 0.997 },
   { name: "CDN / Static Assets", url: "https://cdn.pulsewatch.dev/favicon.ico", intervalSec: 120, sla: 0.9995 },
   { name: "Postgres Primary", url: "tcp://db.pulsewatch.dev:5432", intervalSec: 60, sla: 0.995 },
   { name: "Redis Cache", url: "tcp://cache.pulsewatch.dev:6379", intervalSec: 120, sla: 0.995 },
   { name: "Docs Portal", url: "https://docs.pulsewatch.dev", intervalSec: 300, sla: 0.99 },
+  {
+    name: "Nightly Backup Job",
+    url: "https://backup.pulsewatch.dev/jobs/nightly",
+    intervalSec: 60,
+    sla: 0.999,
+    kind: "HEARTBEAT",
+    heartbeatIntervalSec: 3600,
+    heartbeatGraceSec: 300,
+    lastHeartbeatMinutesAgo: 10,
+  },
 ];
 
 async function main() {
@@ -65,10 +96,14 @@ async function main() {
     status: number | null;
     responseTimeMs: number;
     error: string | null;
+    sslDaysLeft?: number | null;
+    sslWarning?: boolean;
     createdAt: Date;
   }[] = [];
 
   for (const spec of monitorSpecs) {
+    const isHeartbeat = spec.kind === "HEARTBEAT";
+    const { randomBytes } = await import("node:crypto");
     const monitor = await prisma.monitor.create({
       data: {
         userId: user.id,
@@ -76,9 +111,43 @@ async function main() {
         url: spec.url,
         intervalSec: spec.intervalSec,
         status: "UP",
+        kind: spec.kind ?? "HTTP",
+        keyword: spec.keyword ?? null,
+        sslCheckEnabled: spec.sslCheckEnabled ?? false,
+        confirmFailures: spec.confirmFailures ?? 1,
+        heartbeatIntervalSec: spec.heartbeatIntervalSec ?? 3600,
+        heartbeatGraceSec: spec.heartbeatGraceSec ?? 300,
+        heartbeatToken: isHeartbeat ? randomBytes(16).toString("hex") : null,
+        lastHeartbeatAt: isHeartbeat
+          ? new Date(now - (spec.lastHeartbeatMinutesAgo ?? 10) * MINUTE)
+          : null,
+        // Demo SSL state for the keyword/SSL monitor (45 days left).
+        sslExpiresAt: spec.sslCheckEnabled ? new Date(now + 45 * 24 * 60 * MINUTE) : null,
+        sslDaysLeft: spec.sslCheckEnabled ? 45 : null,
         createdAt: new Date(now - DAYS * 24 * 60 * MINUTE),
       },
     });
+
+    if (isHeartbeat) {
+      // Heartbeat monitors are pinged, not probed — seed 24 hourly pings
+      // instead of 90 days of HTTP checks, and no incidents.
+      for (let h = 0; h < 24; h++) {
+        batch.push({
+          monitorId: monitor.id,
+          ok: true,
+          status: null,
+          responseTimeMs: 0,
+          error: null,
+          createdAt: new Date(now - h * 60 * MINUTE),
+        });
+      }
+      await prisma.monitor.update({
+        where: { id: monitor.id },
+        data: { uptime90d: 100, responseTimeMs: 0, lastCheckedAt: new Date(now), status: "UP" },
+      });
+      console.log(`  ✓ monitor ${spec.name} (heartbeat, last ping 10m ago)`);
+      continue;
+    }
 
     // walk backwards in time generating checks with random failures
     let t = now;
@@ -98,6 +167,8 @@ async function main() {
         status: ok ? 200 : null,
         responseTimeMs: ok ? responseTimeMs : 0,
         error: ok ? null : pick(["ETIMEDOUT", "ECONNREFUSED", "502 Bad Gateway", "522 Connection timed out"]),
+        sslDaysLeft: spec.sslCheckEnabled ? 45 : null,
+        sslWarning: false,
         createdAt: new Date(t),
       });
       uptimeLog.push(ok ? 1 : 0);

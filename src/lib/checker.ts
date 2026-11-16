@@ -1,33 +1,83 @@
 import net from "node:net";
+import { getSslExpiry } from "./ssl";
+import { evaluateKeyword } from "./smart-checks";
 
 export type CheckResult = {
   ok: boolean;
   status: number | null;
   responseTimeMs: number;
   error: string | null;
+  /** Set when an SSL check ran (https + sslCheckEnabled). */
+  sslExpiresAt?: Date | null;
+  sslDaysLeft?: number | null;
+  /** True when the cert expires within sslWarnDays (check itself still passes). */
+  sslWarning?: boolean;
+};
+
+export type CheckOptions = {
+  expectedStatus?: number;
+  timeoutMs?: number;
+  maxRetries?: number;
+  /** Body must contain this (case-insensitive), else KEYWORD_NOT_FOUND. */
+  keyword?: string | null;
+  /** Body must NOT contain this, else FORBIDDEN_KEYWORD_FOUND. */
+  forbiddenKeyword?: string | null;
+  /** When true and the URL is https://, fetch the TLS cert expiry. */
+  sslCheckEnabled?: boolean;
+  /** Warn when the cert expires within this many days (default 14). */
+  sslWarnDays?: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const USER_AGENT = "PulseWatch/1.0 (+https://pulsewatch.dev)";
+/** Only this much of a response body is read for keyword evaluation. */
+export const MAX_KEYWORD_BODY_BYTES = 512 * 1024;
 
 /**
  * Run a single availability check against a URL.
  * Supports http(s):// (status code + latency) and tcp://host:port (socket dial).
  * Never throws — all failures are returned as results.
  */
-export async function runCheck(
-  rawUrl: string,
-  opts: { expectedStatus?: number; timeoutMs?: number; maxRetries?: number } = {}
-): Promise<CheckResult> {
+export async function runCheck(rawUrl: string, opts: CheckOptions = {}): Promise<CheckResult> {
   const expectedStatus = opts.expectedStatus ?? 200;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRetries = Math.max(0, opts.maxRetries ?? 0);
+  const sslWarnDays = opts.sslWarnDays ?? 14;
+
+  // SSL expiry is fetched once (not per retry) and merged into the result.
+  let ssl: { expiresAt: Date; daysLeft: number } | null = null;
+  if (opts.sslCheckEnabled && rawUrl.startsWith("https://")) {
+    try {
+      const parsed = new URL(rawUrl);
+      const info = await getSslExpiry(
+        parsed.hostname,
+        parsed.port ? Number(parsed.port) : 443,
+        timeoutMs
+      );
+      if (info) ssl = { expiresAt: info.expiresAt, daysLeft: info.daysLeft };
+    } catch {
+      ssl = null;
+    }
+  }
 
   let last: CheckResult = { ok: false, status: null, responseTimeMs: 0, error: "no attempt" };
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    last = await singleAttempt(rawUrl, expectedStatus, timeoutMs);
-    if (last.ok) return last;
+    last = await singleAttempt(rawUrl, expectedStatus, timeoutMs, opts);
+    if (last.ok) break;
+  }
+
+  if (ssl) {
+    last = {
+      ...last,
+      sslExpiresAt: ssl.expiresAt,
+      sslDaysLeft: ssl.daysLeft,
+      sslWarning: ssl.daysLeft <= sslWarnDays,
+    };
+    if (ssl.daysLeft < 0) {
+      // Expired certificate fails the check regardless of the HTTP result.
+      last = { ...last, ok: false, error: "SSL_EXPIRED" };
+    }
   }
   return last;
 }
@@ -35,7 +85,8 @@ export async function runCheck(
 async function singleAttempt(
   rawUrl: string,
   expectedStatus: number,
-  timeoutMs: number
+  timeoutMs: number,
+  opts: CheckOptions
 ): Promise<CheckResult> {
   const started = Date.now();
 
@@ -65,19 +116,38 @@ async function singleAttempt(
       cache: "no-store",
     });
     const elapsed = Date.now() - started;
-    // drain body so the socket is released
-    try {
-      await res.arrayBuffer();
-    } catch {
-      /* ignore body errors */
+
+    if (res.status !== expectedStatus) {
+      // drain body so the socket is released
+      try {
+        await res.arrayBuffer();
+      } catch {
+        /* ignore body errors */
+      }
+      return {
+        ok: false,
+        status: res.status,
+        responseTimeMs: elapsed,
+        error: `UNEXPECTED_STATUS_${res.status}`,
+      };
     }
-    const ok = res.status === expectedStatus;
-    return {
-      ok,
-      status: res.status,
-      responseTimeMs: elapsed,
-      error: ok ? null : `UNEXPECTED_STATUS_${res.status}`,
-    };
+
+    // Keyword checks only read the body when configured; otherwise drain it.
+    if (opts.keyword?.trim() || opts.forbiddenKeyword?.trim()) {
+      const body = await readBodyCapped(res, MAX_KEYWORD_BODY_BYTES);
+      const kw = evaluateKeyword(body, opts.keyword, opts.forbiddenKeyword);
+      if (!kw.ok) {
+        return { ok: false, status: res.status, responseTimeMs: elapsed, error: kw.error };
+      }
+    } else {
+      try {
+        await res.arrayBuffer();
+      } catch {
+        /* ignore body errors */
+      }
+    }
+
+    return { ok: true, status: res.status, responseTimeMs: elapsed, error: null };
   } catch (err) {
     const elapsed = Date.now() - started;
     const error = err instanceof Error ? normalizeError(err, elapsed >= timeoutMs) : "UNKNOWN";
@@ -85,6 +155,42 @@ async function singleAttempt(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Read at most `maxBytes` of the response body as text, then cancel the stream. */
+async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        const remaining = maxBytes - total;
+        if (remaining <= 0) break;
+        chunks.push(value.subarray(0, remaining));
+        total += Math.min(value.length, remaining);
+        if (total >= maxBytes) break;
+      }
+    }
+  } catch {
+    /* partial body is still usable for keyword matching */
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* ignore */
+    }
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 function tcpDial(rawUrl: string, timeoutMs: number, started: number): Promise<CheckResult> {
@@ -129,6 +235,13 @@ function tcpDial(rawUrl: string, timeoutMs: number, started: number): Promise<Ch
 
 function normalizeError(err: Error, timedOut: boolean): string {
   if (err.name === "AbortError" || timedOut) return "ETIMEDOUT";
+  // fetch() wraps the real failure in a TypeError ("fetch failed") whose
+  // .cause carries the underlying code (e.g. CERT_HAS_EXPIRED, ECONNREFUSED).
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const causeCode = (cause as NodeJS.ErrnoException).code;
+    if (causeCode) return causeCode;
+  }
   const code = (err as NodeJS.ErrnoException).code;
   if (code) return code;
   if (err.message.includes("fetch failed")) return "ECONNREFUSED";

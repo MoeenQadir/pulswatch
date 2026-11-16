@@ -48,6 +48,25 @@ model Monitor {
   updatedAt      DateTime      @updatedAt
   deletedAt      DateTime?
 
+  // ── Smart checks (Option 2) ──────────────────────────────────────────
+  // kind ∈ "HTTP" | "HEARTBEAT" (validated strings; SQLite has no enums).
+  // tcp:// URLs stay kind "HTTP" — they are probed, not heartbeat-pinged.
+  kind              String    @default("HTTP")
+  keyword           String?
+  forbiddenKeyword  String?
+  sslCheckEnabled   Boolean   @default(false)
+  sslWarnDays       Int       @default(14)
+  sslExpiresAt      DateTime?
+  sslDaysLeft       Int?
+  heartbeatToken    String?   @unique
+  heartbeatIntervalSec Int    @default(3600)
+  heartbeatGraceSec Int       @default(300)
+  lastHeartbeatAt   DateTime?
+  // False-positive confirmation: DOWN only after this many consecutive
+  // failed ticks (1 = previous behaviour).
+  confirmFailures   Int       @default(1)
+  consecutiveFailures Int     @default(0)
+
   user     User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   checks   Check[]
   incidents Incident[]
@@ -65,6 +84,8 @@ model Check {
   responseTimeMs Int
   error          String?
   region         String   @default("eu-central")
+  sslDaysLeft    Int?
+  sslWarning     Boolean  @default(false)
   createdAt      DateTime @default(now())
 
   monitor Monitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)

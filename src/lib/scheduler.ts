@@ -2,10 +2,18 @@
  * Scheduler — runs inside the Next.js server process.
  * A setInterval loop (singleton via globalThis) ticks every 30s and dispatches
  * due monitors for checking. No external worker process required.
+ *
+ * Smart checks (Option 2):
+ * - HEARTBEAT monitors are never HTTP-fetched; they go DOWN when no ping
+ *   arrives within heartbeatIntervalSec + heartbeatGraceSec.
+ * - A failed check only marks a monitor DOWN after `confirmFailures`
+ *   consecutive failed ticks, so one blip doesn't open an incident.
  */
 import { prisma } from "./db";
 import { runCheck } from "./checker";
+import type { CheckResult } from "./checker";
 import { deliverWebhook } from "./webhooks";
+import { isHeartbeatOverdue, shouldMarkDown } from "./smart-checks";
 import type { Monitor } from "@prisma/client";
 
 const TICK_MS = 30_000;
@@ -74,12 +82,62 @@ export async function tick(): Promise<number> {
 
 /** Run a check for one monitor, persist the result and manage incidents. */
 export async function checkMonitor(monitor: Monitor): Promise<void> {
+  const now = new Date();
+  const previousStatus = monitor.status;
+
+  // ── Heartbeat monitors: no HTTP fetch, just overdue evaluation ──────────
+  if (monitor.kind === "HEARTBEAT") {
+    const overdue = isHeartbeatOverdue(
+      monitor.lastHeartbeatAt,
+      monitor.heartbeatIntervalSec,
+      monitor.heartbeatGraceSec,
+      now,
+      monitor.createdAt
+    );
+    // Never pinged and still inside the grace window after creation: PENDING,
+    // not DOWN — and no check row yet (there is nothing to report).
+    if (!monitor.lastHeartbeatAt && !overdue) {
+      await prisma.monitor.update({
+        where: { id: monitor.id },
+        data: { status: "PENDING", lastCheckedAt: now },
+      });
+      return;
+    }
+
+    const result: CheckResult = overdue
+      ? { ok: false, status: null, responseTimeMs: 0, error: "HEARTBEAT_MISSED" }
+      : { ok: true, status: null, responseTimeMs: 0, error: null };
+    await applyResult(monitor, result, now, previousStatus);
+    return;
+  }
+
+  // ── HTTP / TCP monitors ─────────────────────────────────────────────────
   const result = await runCheck(monitor.url, {
     expectedStatus: monitor.expectedStatus,
     timeoutMs: monitor.timeoutMs,
     maxRetries: monitor.maxRetries,
+    keyword: monitor.keyword,
+    forbiddenKeyword: monitor.forbiddenKeyword,
+    sslCheckEnabled: monitor.sslCheckEnabled,
+    sslWarnDays: monitor.sslWarnDays,
   });
+  await applyResult(monitor, result, now, previousStatus);
+}
 
+/**
+ * Persist a check result, update the consecutive-failure counter, manage
+ * incidents and fire webhooks on confirmed DOWN/UP transitions.
+ * A failure only becomes DOWN once `consecutiveFailures >= confirmFailures`;
+ * until then the previous status is kept and no incident/webhook fires.
+ * NOTE: this is consecutive-tick confirmation from this single instance —
+ * not a second geographic probe region (see README).
+ */
+async function applyResult(
+  monitor: Monitor,
+  result: CheckResult,
+  now: Date,
+  previousStatus: string
+): Promise<void> {
   await prisma.check.create({
     data: {
       monitorId: monitor.id,
@@ -87,14 +145,20 @@ export async function checkMonitor(monitor: Monitor): Promise<void> {
       status: result.status,
       responseTimeMs: result.responseTimeMs,
       error: result.error,
+      sslDaysLeft: result.sslDaysLeft ?? null,
+      sslWarning: result.sslWarning ?? false,
     },
   });
 
-  const previousStatus = monitor.status;
-  let newStatus: Monitor["status"];
+  const consecutiveFailures = result.ok ? 0 : monitor.consecutiveFailures + 1;
+  const confirmedDown = !result.ok && shouldMarkDown(consecutiveFailures, monitor.confirmFailures);
 
-  if (!result.ok) {
+  let newStatus: Monitor["status"];
+  if (confirmedDown) {
     newStatus = "DOWN";
+  } else if (!result.ok) {
+    // Unconfirmed failure: keep the previous status, open nothing, fire nothing.
+    newStatus = previousStatus;
   } else if (result.responseTimeMs > 2000) {
     newStatus = "DEGRADED";
   } else {
@@ -112,7 +176,7 @@ export async function checkMonitor(monitor: Monitor): Promise<void> {
       data: {
         monitorId: monitor.id,
         status: "INVESTIGATING",
-        cause: result.error,
+        cause: monitor.kind === "HEARTBEAT" ? "HEARTBEAT_MISSED" : result.error,
       },
     });
     incidentId = incident.id;
@@ -121,7 +185,7 @@ export async function checkMonitor(monitor: Monitor): Promise<void> {
   if (newStatus === "UP" && openIncident) {
     await prisma.incident.update({
       where: { id: openIncident.id },
-      data: { status: "RESOLVED", resolvedAt: new Date() },
+      data: { status: "RESOLVED", resolvedAt: now },
     });
   }
 
@@ -129,9 +193,13 @@ export async function checkMonitor(monitor: Monitor): Promise<void> {
     where: { id: monitor.id },
     data: {
       status: newStatus,
+      consecutiveFailures,
       responseTimeMs: result.ok ? result.responseTimeMs : monitor.responseTimeMs,
-      lastCheckedAt: new Date(),
-      lastDownAt: !result.ok ? new Date() : monitor.lastDownAt,
+      lastCheckedAt: now,
+      lastDownAt: newStatus === "DOWN" ? now : monitor.lastDownAt,
+      ...(result.sslExpiresAt !== undefined
+        ? { sslExpiresAt: result.sslExpiresAt, sslDaysLeft: result.sslDaysLeft ?? null }
+        : {}),
     },
   });
 

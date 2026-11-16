@@ -1,5 +1,62 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { runCheck } from "../checker";
+
+let baseUrl = "";
+
+const server = createServer((_req, res) => {
+  res.writeHead(200, { "content-type": "text/html" });
+  res.end("<html><body>Welcome to PulseWatch — uptime monitoring</body></html>");
+});
+
+beforeAll(
+  () =>
+    new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const { port } = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${port}`;
+        resolve();
+      });
+    })
+);
+
+afterAll(
+  () =>
+    new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    })
+);
+
+describe("runCheck — keyword checks (local server)", () => {
+  it("passes when the required keyword is present", async () => {
+    const res = await runCheck(baseUrl, { keyword: "PulseWatch", maxRetries: 0 });
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe(200);
+  }, 10_000);
+
+  it("fails with KEYWORD_NOT_FOUND when the keyword is missing", async () => {
+    const res = await runCheck(baseUrl, { keyword: "Grafana", maxRetries: 0 });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe("KEYWORD_NOT_FOUND");
+  }, 10_000);
+
+  it("fails with FORBIDDEN_KEYWORD_FOUND when the forbidden keyword appears", async () => {
+    const res = await runCheck(baseUrl, { forbiddenKeyword: "uptime", maxRetries: 0 });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe("FORBIDDEN_KEYWORD_FOUND");
+  }, 10_000);
+
+  it("keyword matching is case-insensitive", async () => {
+    const res = await runCheck(baseUrl, { keyword: "pulsewatch", maxRetries: 0 });
+    expect(res.ok).toBe(true);
+  }, 10_000);
+
+  it("does not read the body when no keyword is configured", async () => {
+    const res = await runCheck(baseUrl, { maxRetries: 0 });
+    expect(res.ok).toBe(true);
+  }, 10_000);
+});
 
 describe("runCheck — http", () => {
   it("rejects unsupported protocols", async () => {
